@@ -37,7 +37,17 @@ export MUBU_PASSWORD="your-password"
 export MUBU_MEMBER_ID="your-member-id"
 ```
 
-Or write them to `~/.workbuddy/.env.mubu`:
+Or copy `.env.example` to `.env` in the project root (loaded automatically):
+
+```
+MUBU_PHONE=your-phone
+MUBU_PASSWORD=your-password
+MUBU_MEMBER_ID=your-member-id
+```
+
+Or write them to `~/.workbuddy/.env.mubu` (legacy location):
+
+> Credential lookup order: environment variables → project `.env` → `~/.workbuddy/.env.mubu`. The first non-empty value wins; real environment variables always take precedence.
 
 ```
 MUBU_PHONE=your-phone
