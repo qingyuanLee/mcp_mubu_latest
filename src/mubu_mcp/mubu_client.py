@@ -107,11 +107,29 @@ class MubuClient:
     # Token persistence (via cache or file fallback)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _jwt_expiry(token: str) -> Optional[float]:
+        """Decode the ``exp`` claim from a JWT (seconds since epoch).
+
+        Returns ``None`` when the token is not a decodable JWT.
+        """
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return None
+            payload_b64 = parts[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            exp = payload.get("exp")
+            return float(exp) if exp else None
+        except Exception:
+            return None
+
     def _load_token(self) -> bool:
         # Try cache first
         if self._cache:
             data = self._cache.load_token()
-            if data and time.time() < data.get("expires_at", 0):
+            if data and self._token_still_valid(data):
                 self.token = data["token"]
                 self.user_id = data.get("user_id")
                 self.username = data.get("username")
@@ -124,7 +142,7 @@ class MubuClient:
         if os.path.isfile(token_file):
             try:
                 data = json.loads(open(token_file, encoding="utf-8").read())
-                if time.time() < data.get("expires_at", 0):
+                if self._token_still_valid(data):
                     self.token = data.get("token")
                     self.user_id = data.get("user_id")
                     self.username = data.get("username")
@@ -143,8 +161,26 @@ class MubuClient:
                 pass
         return False
 
+    def _token_still_valid(self, data: Dict[str, Any]) -> bool:
+        """Token record is usable when its local expiry is in the future, or
+        when the JWT itself is still valid (renew the local expiry to the JWT
+        exp to avoid a needless re-login)."""
+        exp = data.get("expires_at") or 0
+        try:
+            exp = float(exp)
+        except (TypeError, ValueError):
+            exp = 0
+        if time.time() < exp:
+            return True
+        jwt_exp = self._jwt_expiry(str(data.get("token") or ""))
+        if jwt_exp and time.time() < jwt_exp:
+            data["expires_at"] = jwt_exp
+            return True
+        return False
+
     def _save_token(self) -> None:
-        self.expires_at = time.time() + 7200
+        jwt_exp = self._jwt_expiry(self.token or "")
+        self.expires_at = jwt_exp or (time.time() + 7200)
         data = {
             "token": self.token,
             "user_id": self.user_id,
@@ -266,11 +302,22 @@ class MubuClient:
         if not self.phone or not self.password:
             raise MubuError("Set MUBU_PHONE and MUBU_PASSWORD env vars or pass them to the constructor.")
 
-        data = self._request(*ENDPOINTS["login"], auth=False, max_retries=0, json={
-            "phone": self.phone,
-            "password": self.password,
-            "callbackType": 0,
-        })
+        try:
+            data = self._request(*ENDPOINTS["login"], auth=False, max_retries=0, json={
+                "phone": self.phone,
+                "password": self.password,
+                "callbackType": 0,
+            })
+        except MubuError as exc:
+            if "frequency" in str(exc).lower() or "login" in str(exc).lower():
+                raise MubuError(
+                    "Login rate limited by Mubu ('Login Frequency'). "
+                    "A valid cached token exists but the login endpoint is "
+                    "throttled; wait a few minutes before retrying.",
+                    status_code=getattr(exc, "status_code", None),
+                    body=getattr(exc, "body", None),
+                ) from exc
+            raise
         self.token = data["token"]
         self.user_id = data["id"]
         self.username = data["name"]
