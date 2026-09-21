@@ -10,6 +10,7 @@ Transport names aligned with MCP SDK 2.1.x: `stdio`, `streamable-http`, `sse` �
 
 - **Full Mubu API**: list, create, read, save, delete, move, rename documents and folders
 - **Round-trip Markdown**: lossless Markdown import/export (headings, checkboxes, notes)
+- **Image support**: upload local images / re-host remote images to Mubu storage (TOS direct upload via STS + TOS4 signing); `![alt](path-or-url)` in Markdown is auto-converted to Mubu image nodes (`images` field with size); images preserved in Markdown/OPML/FreeMind exports
 - **OPML & FreeMind export**: for XMind, Freeplane, and other outliners
 - **Content search**: search by name and inside document bodies
 - **Folder tree export**: recursively export entire folder structures
@@ -118,6 +119,9 @@ class MyCache(CacheBackend):
 | `mubu_export_markdown` | Export as Markdown |
 | `mubu_import_markdown` | Parse Markdown to Mubu JSON (dry run) |
 | `mubu_export_tree` | Export entire folder tree |
+| `mubu_upload_image` | Upload a local image file to Mubu storage |
+| `mubu_upload_image_from_url` | Download a remote image and re-host it on Mubu storage |
+| `mubu_get_recent_images` | List recently used images |
 | `mubu_cache_info` | Show cache backend info |
 | `mubu_cache_clear` | Clear cached data |
 
@@ -213,7 +217,6 @@ mubu-mcp/
 
 ## ⚠️ Known Limitations
 
-- Image and attachment nodes are not supported in Markdown round-trip
 - Ordered lists (`1.`) are not part of the current conversion
 - `save` operations require `MUBU_MEMBER_ID` (cannot be auto-detected from any API)
 - This is an unofficial integration using the same endpoints as the Mubu web app

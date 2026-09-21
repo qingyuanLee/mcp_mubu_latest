@@ -6,6 +6,7 @@ Uses a pluggable cache backend (SQLite built-in) for token and user info caching
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 from typing import Any, Optional
@@ -21,6 +22,8 @@ from mubu_mcp.mubu_convert import (
     doc_to_markdown,
     export_markdown,
     markdown_to_doc,
+    markdown_to_mubu_tree,
+    parse_image_size,
 )
 from mubu_mcp.mubu_config import MubuError, logger
 
@@ -50,6 +53,110 @@ def _get_client() -> MubuClient:
     if _client is None:
         _client = MubuClient(cache=_get_cache())
     return _client
+
+
+# ---------------------------------------------------------------------------
+# Helpers for folder-path resolution and auto naming
+# ---------------------------------------------------------------------------
+
+
+def _auto_name() -> str:
+    """Auto-generate a document name: mbmcp_YYYYMMDD_HHMMSS (local time)."""
+    return "mbmcp_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _resolve_folder(client: MubuClient, folder_id: str, folder_path: str) -> str:
+    """Resolve the target folder: ``folder_path`` takes priority (auto-created
+    if missing), otherwise fall back to ``folder_id`` ("0" = root)."""
+    if folder_path and folder_path.strip():
+        return client.ensure_folder_path(folder_path)
+    return folder_id or "0"
+
+
+def _plain_text(node_html: str) -> str:
+    """Strip <span>…</span> (or any tags) from a node's text field."""
+    import re as _re
+    return _re.sub(r"<[^>]+>", "", node_html or "").strip()
+
+
+def _resolve_image_callback(client: MubuClient):
+    """Build the ``resolve_image(uri, alt)`` callback for markdown conversion.
+
+    - Local file paths are uploaded to Mubu (returns hosted URL + size).
+    - http(s) URLs are referenced directly; image size is fetched when possible.
+    - Unresolvable refs return None (kept as literal text).
+    """
+
+    def _resolve(uri: str, alt: str = ""):
+        uri = (uri or "").strip()
+        if not uri:
+            return None
+        if uri.startswith(("http://", "https://")):
+            ow = oh = 0
+            try:
+                resp = client._session.get(uri, timeout=15)
+                if resp.status_code == 200:
+                    size = parse_image_size(resp.content)
+                    if size:
+                        ow, oh = size
+            except Exception:
+                pass
+            return {"uri": uri, "ow": ow, "oh": oh, "w": min(ow, 800) if ow else 0}
+        try:
+            info = client.upload_image_from_path(uri)
+            ow = oh = 0
+            try:
+                with open(uri, "rb") as f:
+                    size = parse_image_size(f.read())
+                if size:
+                    ow, oh = size
+            except Exception:
+                pass
+            return {
+                "uri": info["url"],
+                "ow": ow,
+                "oh": oh,
+                "w": min(ow, 800) if ow else 0,
+            }
+        except Exception:
+            return None
+
+    return _resolve
+
+
+def _write_doc_content(client: MubuClient, doc_id: str, markdown: str, name: str = "") -> tuple[str, bool]:
+    """Write parsed Markdown content into a Mubu document.
+
+    Strategy (verified against the live server):
+    - Empty document (no nodes)          → create root node with full subtree in place.
+    - Document with root only            → update root text + create children under it.
+    - Document with existing children    → delete + recreate (same name & folder);
+                                            returns the new doc id (recreated=True).
+    Returns ``(final_doc_id, recreated)``.
+    """
+    root_node = markdown_to_mubu_tree(markdown, resolve_image=_resolve_image_callback(client))
+    doc = client.get_doc(doc_id)
+    nodes = doc.get("nodes") or []
+
+    if not nodes:
+        client.save_doc(doc_id, events=[client.build_create_root_event(root_node)])
+        return doc_id, False
+
+    old_root = nodes[0]
+    children = old_root.get("children") or []
+    if not children:
+        events = [client.build_update_root_event(old_root, _plain_text(root_node.get("text")))]
+        events.extend(client.build_create_children_events(old_root.get("id", ""), root_node.get("children") or []))
+        client.save_doc(doc_id, events=events)
+        return doc_id, False
+
+    # Existing content cannot be replaced in place (no delete event); recreate.
+    meta = client.get_doc_meta(doc_id)
+    new_name = name.strip() if name and name.strip() else (meta.get("name") or _auto_name())
+    client.delete_doc(doc_id)
+    new_id = client.create_doc(new_name, meta.get("folder_id") or "0")
+    client.save_doc(new_id, events=[client.build_create_root_event(root_node)])
+    return new_id, True
 
 
 # ===================================================================
@@ -144,22 +251,36 @@ def mubu_create_doc(name: str, folder_id: str = "0") -> str:
 
 
 @mcp.tool()
-def mubu_create_doc_from_markdown(name: str, markdown: str, folder_id: str = "0") -> str:
+def mubu_create_doc_from_markdown(markdown: str, name: str = "", folder_id: str = "0", folder_path: str = "") -> str:
     """Create a Mubu document from Markdown content.
 
     The Markdown is parsed into a Mubu outline structure. Supports headings,
     bullet lists, checkboxes ([x] / [ ]), and block quotes (> note).
 
+    Output style (default, i-have-adhd): organize the Markdown as a 2-5 level
+    outline — lead with an actionable first line, one-sentence conclusion per
+    section, numbered steps, concrete time estimates, visible evidence, error
+    codes stated plainly, lists capped at 5 per group, no pleasantries.
+    See skill references/i-have-adhd.md for the full rules; follow the user's
+    explicit style request when one is given.
+
     Args:
-        name: Document title.
+        name: Document title. If empty, auto-generated as "mbmcp_<timestamp>"
+              (e.g. mbmcp_20260916_121530).
         markdown: Markdown content to import.
-        folder_id: Parent folder ID. Use "0" for root.
+        folder_id: Parent folder ID. Use "0" for root (ignored when folder_path is set).
+        folder_path: Folder path like "工作/项目A/子目录"; existing folders are reused,
+                     missing ones are created automatically.
     """
     client = _get_client()
-    doc = markdown_to_doc(markdown)
-    node_json = json.dumps(doc.get("node", {}), ensure_ascii=False)
-    doc_id = client.create_doc(name, folder_id, content=node_json)
-    return f"Document created from Markdown: [{doc_id}] {name}"
+    folder_id = _resolve_folder(client, folder_id, folder_path)
+    if not name or not name.strip():
+        name = _auto_name()
+    root_node = markdown_to_mubu_tree(markdown, resolve_image=_resolve_image_callback(client))
+    doc_id = client.create_doc(name, folder_id)
+    client.save_doc(doc_id, events=[client.build_create_root_event(root_node)])
+    target = folder_path.strip() if folder_path and folder_path.strip() else f"[{folder_id}]"
+    return f"Document created from Markdown: [{doc_id}] {name} (folder: {target})"
 
 
 # --- Get / read ---------------------------------------------------------
@@ -192,29 +313,83 @@ def mubu_get_doc_raw(doc_id: str) -> str:
 
 
 @mcp.tool()
-def mubu_save_doc_markdown(doc_id: str, markdown: str) -> str:
+def mubu_save_doc_markdown(doc_id: str, markdown: str, folder_path: str = "", name: str = "") -> str:
     """Overwrite a Mubu document with new Markdown content.
 
     The Markdown is parsed into a Mubu outline structure and written
     back to the document (round-trip safe).
 
+    Output style (default, i-have-adhd): same rules as
+    mubu_create_doc_from_markdown — 2-5 level outline, actionable lead,
+    one-sentence conclusions, numbered steps, concrete estimates, visible
+    evidence, plain error codes, lists capped at 5 per group, no pleasantries.
+    Follow the user's explicit style request when one is given.
+
     Args:
         doc_id: The document ID to update.
         markdown: New Markdown content.
+        folder_path: Optional folder path like "工作/项目A/子目录"; existing folders
+                     are reused, missing ones are created automatically, and the
+                     document is moved there if it is not already inside.
+        name: Optional new document name (applied after save).
     """
     client = _get_client()
-    doc = markdown_to_doc(markdown)
-    client.save_doc(doc_id)
-    # Get current doc to build proper event
-    raw = client.get_doc(doc_id)
-    node_json = json.dumps(doc.get("node", {}), ensure_ascii=False)
-    doc_struct = json.loads(node_json) if isinstance(node_json, str) else doc.get("node", {})
-    # Build update from parsed markdown nodes
-    update_doc = {"nodes": [doc_struct] if "text" in doc_struct else doc_struct.get("children", [])}
-    if "text" in doc_struct:
-        update_doc["nodes"] = [{"text": doc_struct.get("text", ""), "children": doc_struct.get("children", [])}]
-    client.save_doc(doc_id, events=[client.build_update_event(update_doc, doc_id)])
-    return f"Document [{doc_id}] updated from Markdown."
+    if folder_path and folder_path.strip():
+        target = client.ensure_folder_path(folder_path)
+        if not client.doc_exists_in_folder(target, doc_id):
+            client.move(doc_id, target, "doc")
+    final_id, recreated = _write_doc_content(client, doc_id, markdown, name=name)
+    msg = f"Document [{doc_id}] updated from Markdown."
+    if recreated:
+        msg = (
+            f"Document [{doc_id}] already had content that cannot be replaced in place; "
+            f"recreated it as [{final_id}] (same folder). Use the new id for later saves."
+        )
+    if name and name.strip():
+        if not recreated:
+            client.rename_doc(final_id, name.strip())
+        msg += f" Renamed to '{name.strip()}'."
+    return msg
+
+
+@mcp.tool()
+def mubu_upsert_doc_markdown(markdown: str, name: str = "", folder_path: str = "", folder_id: str = "0") -> str:
+    """Save Markdown as a Mubu document — create it if missing, update it if the
+    target already exists.
+
+    The target is resolved as ``folder_path`` (existing folders are reused,
+    missing ones are created automatically) + ``name`` (auto-generated as
+    "mbmcp_<timestamp>" when empty). If a document with the same name already
+    exists in the target folder, its content is overwritten instead of creating
+    a duplicate.
+
+    Output style (default, i-have-adhd): same rules as
+    mubu_create_doc_from_markdown — 2-5 level outline, actionable lead,
+    one-sentence conclusions, numbered steps, concrete estimates, visible
+    evidence, plain error codes, lists capped at 5 per group, no pleasantries.
+    Follow the user's explicit style request when one is given.
+
+    Args:
+        markdown: Markdown content to import.
+        name: Document title. If empty, auto-generated as "mbmcp_<timestamp>".
+        folder_path: Folder path like "工作/项目A/子目录".
+        folder_id: Parent folder ID. Use "0" for root (ignored when folder_path is set).
+    """
+    client = _get_client()
+    folder_id = _resolve_folder(client, folder_id, folder_path)
+    if not name or not name.strip():
+        name = _auto_name()
+    target = folder_path.strip() if folder_path and folder_path.strip() else f"[{folder_id}]"
+    existing = client.find_doc_in_folder(folder_id, name)
+    if existing:
+        final_id, recreated = _write_doc_content(client, existing, markdown, name=name)
+        if recreated:
+            return f"Document recreated: [{final_id}] {name} (folder: {target}); previous id [{existing}] was replaced."
+        return f"Document updated: [{final_id}] {name} (folder: {target})"
+    root_node = markdown_to_mubu_tree(markdown, resolve_image=_resolve_image_callback(client))
+    doc_id = client.create_doc(name, folder_id)
+    client.save_doc(doc_id, events=[client.build_create_root_event(root_node)])
+    return f"Document created: [{doc_id}] {name} (folder: {target})"
 
 
 @mcp.tool()
@@ -367,6 +542,73 @@ def mubu_export_tree(folder_id: str = "0") -> str:
     client = _get_client()
     result = client.export_tree(folder_id)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# --- Images ---------------------------------------------------------------
+
+
+@mcp.tool()
+def mubu_upload_image(image_path: str) -> str:
+    """Upload a local image file to Mubu and get a hosted URL.
+
+    The image is uploaded to Mubu's image storage and returns:
+      - key: storage key (document_image/...)
+      - url: public URL (https://api2.mubu.com/v3/document_image/...)
+      - ext / size
+
+    Use the returned url in Markdown as ![alt](url) when creating or saving
+    documents.
+
+    Args:
+        image_path: Absolute or relative path to a local image file
+                    (png/jpg/jpeg/gif/webp/bmp).
+    """
+    client = _get_client()
+    info = client.upload_image_from_path(image_path)
+    return (
+        f"Image uploaded.\n"
+        f"  key: {info['key']}\n"
+        f"  url: {info['url']}\n"
+        f"  ext: {info['ext']}, size: {info['size']} bytes"
+    )
+
+
+@mcp.tool()
+def mubu_upload_image_from_url(image_url: str) -> str:
+    """Download an image from a URL and upload it to Mubu (hosted copy).
+
+    The image is re-hosted on Mubu's storage so it will not break if the
+    original hotlink dies. Returns the hosted url, ready to be used in
+    Markdown as ![alt](url).
+
+    Args:
+        image_url: http(s) URL of the image to download and re-host.
+    """
+    client = _get_client()
+    info = client.upload_image_from_url(image_url)
+    return (
+        f"Image re-hosted on Mubu.\n"
+        f"  key: {info['key']}\n"
+        f"  url: {info['url']}\n"
+        f"  ext: {info['ext']}, size: {info['size']} bytes"
+    )
+
+
+@mcp.tool()
+def mubu_get_recent_images(limit: int = 20) -> str:
+    """List recently used images (most recent first).
+
+    Args:
+        limit: Maximum number of images to return (default 20).
+    """
+    client = _get_client()
+    items = client.get_recent_images(limit=limit)
+    if not items:
+        return "(no recently used images)"
+    lines = [f"Recent images ({len(items)}):"]
+    for it in items:
+        lines.append(f"  {it['url']}  (key: {it['key']})")
+    return "\n".join(lines)
 
 
 # --- Cache management ---------------------------------------------------

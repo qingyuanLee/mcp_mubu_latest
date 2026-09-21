@@ -6,11 +6,15 @@ to use the CacheBackend abstraction for token / user / document caching.
 
 from __future__ import annotations
 
+import base64
+import datetime
+import hashlib
+import hmac
 import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -30,6 +34,8 @@ from mubu_mcp.mubu_config import (
 )
 from mubu_mcp.mubu_convert import (
     export_markdown,
+    gen_member_id,
+    gen_node_id,
     normalize_node,
     safe_filename,
 )
@@ -64,9 +70,11 @@ class MubuClient:
         # Restore cached token
         self._load_token()
 
-        # member_id priority: env > cache > constructor arg
-        if not self.member_id:
-            self.member_id = member_id or os.getenv("MUBU_MEMBER_ID")
+        # member_id: env/arg wins; otherwise generate a fresh random one
+        # (the web client issues a random 16-digit member id per editing
+        # session; the plain user id is NOT a valid member id and its use
+        # makes the server accept saves without persisting content).
+        self.member_id = member_id or os.getenv("MUBU_MEMBER_ID") or gen_member_id()
 
     # ------------------------------------------------------------------
     # Env file loading
@@ -115,7 +123,7 @@ class MubuClient:
         token_file = os.path.expanduser("~/.mubu_token")
         if os.path.isfile(token_file):
             try:
-                data = json.loads(open(token_file).read())
+                data = json.loads(open(token_file, encoding="utf-8").read())
                 if time.time() < data.get("expires_at", 0):
                     self.token = data.get("token")
                     self.user_id = data.get("user_id")
@@ -156,7 +164,7 @@ class MubuClient:
         try:
             os.makedirs(os.path.dirname(token_file), exist_ok=True)
             tmp = token_file + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.rename(tmp, token_file)
             os.chmod(token_file, 0o600)
@@ -266,8 +274,10 @@ class MubuClient:
         self.token = data["token"]
         self.user_id = data["id"]
         self.username = data["name"]
+        # memberId is not exposed by the login API; keep whatever session
+        # member id was already generated (or generate one).
         if not self.member_id:
-            self.member_id = data.get("memberId") or data.get("member_id")
+            self.member_id = gen_member_id()
         self._save_token()
         return {"token": self.token, "user_id": self.user_id, "username": self.username}
 
@@ -288,7 +298,7 @@ class MubuClient:
 
     def create_doc(self, name: str, folder_id: str = "0", content: str = "") -> str:
         data = self._request(*ENDPOINTS["create_doc"], json={"folderId": folder_id, "name": name, "content": content})
-        doc_id = data.get("doc", {}).get("id", "")
+        doc_id = data.get("id", "") or (data.get("doc", {}) or {}).get("id", "")
         if self._cache and doc_id:
             self._cache.invalidate_doc(doc_id)
         return doc_id
@@ -317,7 +327,77 @@ class MubuClient:
 
         return result
 
+    def get_doc_meta(self, doc_id: str) -> Dict:
+        """Fetch document metadata (parent folder, name, base version) without
+        node caching. Used by save flows that may need to recreate a doc."""
+        self.ensure_login()
+        data = self._request(*ENDPOINTS["get_doc"], json={
+            "docId": doc_id, "password": "", "isFromDocDir": True,
+        })
+        directory = data.get("directory") or []
+        folder_id = "0"
+        if directory:
+            folder_id = directory[-1].get("id") or "0"
+        return {
+            "folder_id": folder_id,
+            "name": data.get("name") or "",
+            "base_version": data.get("baseVersion") or 0,
+            "definition": data.get("definition") or "{}",
+        }
+
+    # ------------------------------------------------------------------
+    # Changeset event builders (real Mubu colla/events schema)
+    # ------------------------------------------------------------------
+
+    def build_create_root_event(self, root_node: Dict) -> Dict:
+        """Event that creates the root node of an empty document, carrying a
+        full subtree. Verified against the live server."""
+        return {
+            "name": "create",
+            "created": [{"index": 0, "parentId": None, "node": root_node, "path": ["nodes", 0]}],
+        }
+
+    def build_create_children_events(self, parent_id: str, children: List[Dict], start_index: int = 0) -> List[Dict]:
+        """Events that append child nodes under ``parent_id`` (index/path
+        aligned with the real web client)."""
+        events = []
+        for i, child in enumerate(children):
+            idx = start_index + i
+            events.append({
+                "name": "create",
+                "created": [{
+                    "index": idx,
+                    "parentId": parent_id,
+                    "node": child,
+                    "path": ["nodes", 0, "children", idx],
+                }],
+            })
+        return events
+
+    def build_update_root_event(self, old_root: Dict, new_text: str) -> Dict:
+        """Event that updates the root node's text (children are NOT changed
+        by an update event — verified against the live server)."""
+        return {
+            "name": "update",
+            "updated": [{
+                "updated": {
+                    "id": old_root.get("id", ""),
+                    "text": f"<span>{str(new_text or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</span>",
+                    "modified": int(time.time() * 1000),
+                },
+                "original": {
+                    "id": old_root.get("id", ""),
+                    "text": old_root.get("text", ""),
+                    "modified": old_root.get("modified", 0),
+                },
+                "path": ["nodes", 0],
+            }],
+        }
+
     def build_update_event(self, doc_definition: Dict, doc_id: str) -> Dict:
+        """(Legacy) Build an update event for the whole document. The server
+        only applies the root text; use the explicit builders for real
+        structure changes."""
         nodes = doc_definition.get("nodes", []) if isinstance(doc_definition, dict) else []
         normalized_nodes = [normalize_node(n) for n in nodes]
         root = {"id": doc_id, "children": normalized_nodes, "modified": int(time.time() * 1000)}
@@ -333,10 +413,9 @@ class MubuClient:
                 events = [self.build_update_event(definition, doc_id)]
 
         if not self.member_id:
-            raise MubuError(
-                "Saving requires MUBU_MEMBER_ID. Set it as an env var "
-                "(find it in your browser's mubu.com network requests)."
-            )
+            # Random session member id (web client behaviour); the plain user
+            # id is not a valid member id.
+            self.member_id = gen_member_id()
 
         payload = {
             "memberId": self.member_id,
@@ -378,6 +457,57 @@ class MubuClient:
         self._request("POST", "/list/rename_folder", json={
             "id": folder_id, "name": new_name, "folderId": folder_id,
         })
+
+    # ------------------------------------------------------------------
+    # Folder path helpers (resolve / auto-create by slash-separated path)
+    # ------------------------------------------------------------------
+
+    def find_folder_by_path(self, path: str, root_folder_id: str = "0") -> Optional[str]:
+        """Resolve a slash-separated folder path to a folder ID.
+
+        Path is relative to ``root_folder_id`` (default "0" = root), e.g.
+        ``"工作/项目A/子目录"``. Returns the final folder ID, or ``None``
+        if any segment does not exist.
+        """
+        segments = [s for s in (path or "").strip().strip("/").split("/") if s]
+        current = root_folder_id
+        for seg in segments:
+            data = self.get_list(current)
+            folders = data.get("folders", []) or []
+            found = next((f.get("id") for f in folders if f.get("name") == seg), None)
+            if not found:
+                return None
+            current = found
+        return current
+
+    def ensure_folder_path(self, path: str, root_folder_id: str = "0") -> str:
+        """Ensure a slash-separated folder path exists, creating missing
+        folders level by level. Returns the final folder ID."""
+        segments = [s for s in (path or "").strip().strip("/").split("/") if s]
+        current = root_folder_id
+        for seg in segments:
+            data = self.get_list(current)
+            folders = data.get("folders", []) or []
+            found = next((f.get("id") for f in folders if f.get("name") == seg), None)
+            if not found:
+                found = self.create_folder(seg, current)
+            current = found
+        return current
+
+    def doc_exists_in_folder(self, folder_id: str, doc_id: str) -> bool:
+        """Check whether a document already lives in the given folder."""
+        data = self.get_list(folder_id)
+        docs = data.get("documents") or data.get("docs") or []
+        return any(d.get("id") == doc_id for d in docs)
+
+    def find_doc_in_folder(self, folder_id: str, name: str) -> Optional[str]:
+        """Find a document by exact name inside a folder. Returns its ID or None."""
+        data = self.get_list(folder_id)
+        docs = data.get("documents") or data.get("docs") or []
+        for d in docs:
+            if d.get("name") == name:
+                return d.get("id")
+        return None
 
     # ------------------------------------------------------------------
     # Search
@@ -490,6 +620,176 @@ class MubuClient:
 
         tree = walk(root_folder_id, 0)
         return {"tree": tree, **stats}
+
+
+    # ------------------------------------------------------------------
+    # Image upload (TOS direct upload via STS + TOS4 signature)
+    # ------------------------------------------------------------------
+
+    def _get_tos_sts(self) -> Dict[str, str]:
+        """Fetch temporary TOS credentials (AK/SK/sessionToken) for uploads."""
+        data = self._request("GET", "/tos/sts")
+        return data["credentials"]
+
+    def _tos_put_object(
+        self,
+        ak: str,
+        sk: str,
+        sts_token: str,
+        key: str,
+        content: bytes,
+        content_type: str,
+    ) -> None:
+        """Upload an object to the mubu-img TOS bucket using TOS4-HMAC-SHA256.
+
+        Endpoint / region / bucket / key layout match the web client:
+        PUT https://mubu-img.tos-cn-shanghai.volces.com/{key}
+        """
+        region = "cn-shanghai"
+        endpoint = "tos-cn-shanghai.volces.com"
+        bucket = "mubu-img"
+        algo = "TOS4-HMAC-SHA256"
+        host = f"{bucket}.{endpoint}"
+        path = "/" + key
+        now = datetime.datetime.now(datetime.timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        payload_hash = hashlib.sha256(content).hexdigest()
+
+        headers = {
+            "host": host,
+            "x-tos-date": amz_date,
+            "x-tos-content-sha256": payload_hash,
+            "x-tos-security-token": sts_token,
+            "content-type": content_type,
+        }
+        signed_headers = ";".join(sorted(headers.keys()))
+        canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers.keys()))
+        canonical_request = "\n".join(
+            ["PUT", path, "", canonical_headers, signed_headers, payload_hash]
+        )
+        credential_scope = f"{date_stamp}/{region}/tos/request"
+        string_to_sign = "\n".join(
+            [algo, amz_date, credential_scope, hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()]
+        )
+
+        def _sign(key: bytes, msg: str) -> bytes:
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+        k_date = _sign(sk.encode("utf-8"), date_stamp)
+        k_region = _sign(k_date, region)
+        k_service = _sign(k_region, "tos")
+        k_signing = _sign(k_service, "request")
+        signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        headers["Authorization"] = (
+            f"{algo} Credential={ak}/{credential_scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        )
+        url = f"https://{host}{path}"
+        resp = self._session.put(url, data=content, headers=headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            raise MubuError(
+                f"TOS upload failed (status={resp.status_code}): {resp.text[:300]}",
+                status_code=resp.status_code,
+            )
+
+    def upload_image_bytes(self, data: bytes, filename: str = "image.png") -> Dict[str, Any]:
+        """Upload image bytes to Mubu's image storage.
+
+        Returns ``{"key", "url", "ext", "size"}`` where ``key`` is the
+        ``document_image/...`` storage key and ``url`` is the public
+        ``https://api2.mubu.com/v3/document_image/...`` URL.
+        """
+        ext = os.path.splitext(filename)[1].lower().lstrip(".")
+        if not ext:
+            ext = "png"
+        content_type = {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "gif": "image/gif",
+            "webp": "image/webp",
+            "bmp": "image/bmp",
+        }.get(ext, "application/octet-stream")
+
+        creds = self._get_tos_sts()
+        key = f"document_image/{self.user_id}_{uuid.uuid4()}.{ext}"
+        self._tos_put_object(
+            creds["accessKeyId"],
+            creds["secretAccessKey"],
+            creds["sessionToken"],
+            key,
+            data,
+            content_type,
+        )
+        short = key.split("/", 1)[1]
+        url = f"https://api2.mubu.com/v3/document_image/{short}"
+
+        # Sync to recently-used images (web client behaviour)
+        try:
+            self._request(
+                "POST",
+                "/document/sync_recently_used_img",
+                json={"imageIdList": [key]},
+            )
+        except MubuError:
+            pass
+
+        return {"key": key, "url": url, "ext": ext, "size": len(data)}
+
+    def upload_image_from_path(self, file_path: str) -> Dict[str, Any]:
+        """Upload a local image file to Mubu. Returns ``{key, url, ext, size}``."""
+        if not os.path.isfile(file_path):
+            raise MubuError(f"Image file not found: {file_path}")
+        with open(file_path, "rb") as f:
+            data = f.read()
+        return self.upload_image_bytes(data, os.path.basename(file_path))
+
+    def upload_image_from_url(self, image_url: str) -> Dict[str, Any]:
+        """Download an image from a URL and upload it to Mubu.
+
+        Returns ``{key, url, ext, size}``. The ``url`` is the Mubu-hosted
+        public URL (avoids external hotlink breakage).
+        """
+        resp = requests.get(image_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            raise MubuError(f"Failed to download image (status={resp.status_code}): {image_url}")
+        content_type = resp.headers.get("content-type") or ""
+        ext = ""
+        if "png" in content_type:
+            ext = "png"
+        elif "jpeg" in content_type or "jpg" in content_type:
+            ext = "jpg"
+        elif "gif" in content_type:
+            ext = "gif"
+        elif "webp" in content_type:
+            ext = "webp"
+        else:
+            import posixpath
+            from urllib.parse import urlparse
+
+            base = posixpath.basename(urlparse(image_url).path)
+            ext = os.path.splitext(base)[1].lower().lstrip(".")
+            if ext not in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+                ext = "png"
+        return self.upload_image_bytes(resp.content, f"image.{ext}")
+
+    def get_recent_images(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """List recently used images (most recent first)."""
+        data = self._request("GET", "/document/user_img")
+        items = data or []
+        out = []
+        for item in items[:limit]:
+            key = item.get("keyImg") or ""
+            short = key.split("/", 1)[1] if key.startswith("document_image/") else key
+            out.append({
+                "key": key,
+                "url": f"https://api2.mubu.com/v3/document_image/{short}" if short else "",
+                "create_time": item.get("createTime"),
+            })
+        return out
+
 
 
 def _keyword_in_nodes(nodes: Any, keyword_lower: str) -> bool:
